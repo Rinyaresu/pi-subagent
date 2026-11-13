@@ -15,7 +15,9 @@ Give each child a short, descriptive name. The name appears in the parent UI, wh
 subagent spawn --name implementation --prompt "Complete task"
 ```
 
-By default, the child inherits the current Pi provider, model, and reasoning level from the bash environment. Use `--provider`, `--model`, or `--thinking` only when deliberately choosing a different configuration, for example a faster model for simple investigation or a stronger model for difficult review. Never pass `$PI_PROVIDER`, `$PI_MODEL`, or `$PI_REASONING_LEVEL` back to the CLI explicitly.
+Choose a provider/model pair from the parent session's Scoped Models, supplied automatically in the system prompt. The CLI rejects unlisted models and blocks spawning when the scope is empty or unavailable. Existing provider and authorization restrictions still apply; if no listed model is eligible, report the blocker instead of changing the scope or selecting an unlisted fallback.
+
+Without overrides, the child inherits the current provider, model, and reasoning level; a thinking level pinned in Scoped Models takes precedence over inherited reasoning. Use `--provider`, `--model`, or `--thinking` to deliberately choose another eligible configuration. Never pass `$PI_PROVIDER`, `$PI_MODEL`, or `$PI_REASONING_LEVEL` back to the CLI explicitly.
 
 `--cwd` defaults to the current directory. Repeat `--prompt` and `--file` as needed; Pi receives all of them in the first user turn. Run `subagent spawn` directly without piping or redirecting its concise output.
 

@@ -25,6 +25,8 @@ import {
 	writeMetadata,
 } from "./shared.ts";
 
+import { requireScopedModel } from "./model-scope.ts";
+
 const VALID_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const extensionPath = join(dirname(fileURLToPath(import.meta.url)), "index.ts");
 
@@ -149,6 +151,8 @@ function spawnSubagent(args: string[]): void {
 
 	if (!provider) fail("No provider specified and PI_PROVIDER is not set");
 	if (!model) fail("No model specified and PI_MODEL is not set");
+	const scopedModel = requireScopedModel(provider, model);
+	if (!args.includes("--thinking") && scopedModel.thinkingLevel) thinking = scopedModel.thinkingLevel;
 	if (!VALID_THINKING_LEVELS.has(thinking)) fail(`Invalid thinking level: ${thinking}`);
 	if (tools !== undefined && !tools.split(",").some((name) => name.trim()))
 		fail("--tools requires at least one tool name");

@@ -13,6 +13,8 @@ import {
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
+import { readModelScope, requireScopedModel } from "./model-scope.ts";
+
 export type RunState = "starting" | "busy" | "idle" | "exited" | "error";
 
 export interface RunMetadata {
@@ -157,6 +159,10 @@ export function tmuxSessionExists(session: string): boolean {
 
 /** Start the child pi process for a run in its tmux session. `initialArgs` are only passed on first spawn. */
 export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): void {
+	requireScopedModel(metadata.provider, metadata.model);
+	const modelPatterns = readModelScope().map((model) =>
+		`${model.provider}/${model.id}${model.thinkingLevel ? `:${model.thinkingLevel}` : ""}`,
+	).join(",");
 	let launcher = "pi";
 	const testLauncher = join(metadata.cwd, "pi-test.sh");
 	try {
@@ -191,6 +197,8 @@ export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): vo
 			metadata.model,
 			"--thinking",
 			metadata.thinking,
+			"--models",
+			modelPatterns,
 			...(metadata.launchArgs ?? []),
 			...initialArgs,
 		],

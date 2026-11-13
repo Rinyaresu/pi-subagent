@@ -19,6 +19,8 @@ import {
 	waitForRunShutdown,
 } from "./shared.ts";
 
+import { MODEL_SCOPE_ENV, modelScopePrompt, type ScopedModel } from "./model-scope.ts";
+
 const packageDir = dirname(fileURLToPath(import.meta.url));
 
 function isInboxMessage(value: unknown): value is InboxMessage {
@@ -34,6 +36,20 @@ function displayState(metadata: RunMetadata): string {
 export default function subagentExtension(pi: ExtensionAPI) {
 	const runDir = process.env.PI_SUBAGENT_RUN_DIR;
 	if (!runDir) {
+		const syncModelScope = (ctx: ExtensionContext): ScopedModel[] => {
+			const models = ctx.scopedModels.map(({ model, thinkingLevel }) => ({
+				provider: model.provider,
+				id: model.id,
+				thinkingLevel,
+			}));
+			process.env[MODEL_SCOPE_ENV] = JSON.stringify(models);
+			return models;
+		};
+		pi.on("session_start", (_event, ctx) => { syncModelScope(ctx); });
+		pi.on("tool_call", (_event, ctx) => { syncModelScope(ctx); });
+		pi.on("before_agent_start", (event, ctx) => ({
+			systemPrompt: `${event.systemPrompt}\n\n${modelScopePrompt(syncModelScope(ctx))}`,
+		}));
 		pi.on("resources_discover", () => ({ skillPaths: [join(packageDir, "skills")] }));
 	}
 

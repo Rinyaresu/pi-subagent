@@ -31,7 +31,11 @@ subagent spawn --name review --prompt "Review the current diff independently"
 
 Names appear in the parent UI. Generated handles remain the stable identifiers used by management commands.
 
-Override the model configuration when needed:
+The parent session's Scoped Models are the allowlist for spawning and resuming children. The extension supplies the resolved list automatically through the environment and the system prompt; no settings-file lookup is needed. Unlisted provider/model pairs are rejected, including inherited models. Empty scopes block spawning: select models with `/scoped-models` first. After installing this change, run `/reload` in existing parent sessions. Provider and authorization policies remain additional constraints.
+
+Children receive the same scope through `--models`. Suspended children whose models are no longer listed are not relaunched. Pinned thinking levels apply unless `--thinking` explicitly overrides them.
+
+Override the model configuration with a pair from your scope when needed:
 
 ```sh
 subagent spawn \
