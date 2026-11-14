@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { launchRun, readMetadata, writeMetadata, type RunMetadata } from "./shared.ts";
@@ -14,11 +14,14 @@ test("real Herdr launches an idle Pi natively, focuses it, and closes only its p
 }, async () => {
 	const artifacts = join(homedir(), ".local/state/pi/work-artifacts/pi-subagent");
 	mkdirSync(artifacts, { recursive: true });
-	const dir = mkdtempSync(join(artifacts, "herdr-live-"));
+	const dir = mkdtempSync(join(artifacts, "live-"));
 	const config = join(dir, "config.toml");
-	writeFileSync(config, 'onboarding = false\n[terminal]\ndefault_shell = "/bin/bash"\n');
-	const session = `pi-subagent-test-${process.pid}`;
-	const env = { ...process.env, HERDR_CONFIG_PATH: config, HERDR_SOCKET_PATH: "", HERDR_ENV: "", HERDR_SESSION: "" };
+	writeFileSync(config, 'onboarding = false\n[terminal]\ndefault_shell = "/bin/bash"\n[update]\nversion_check = false\nmanifest_check = false\n');
+	// State lives under artifacts; a temporary symlink keeps Unix socket names below sun_path limits.
+	const alias = mkdtempSync(join(tmpdir(), "pi-herdr-"));
+	symlinkSync(dir, join(alias, "xdg"), "dir");
+	const session = "smoke";
+	const env = { ...process.env, XDG_CONFIG_HOME: join(alias, "xdg"), HERDR_CONFIG_PATH: config, HERDR_SOCKET_PATH: "", HERDR_ENV: "", HERDR_SESSION: "" };
 	const server = spawn("herdr", ["--session", session, "server"], { env, stdio: ["ignore", "pipe", "pipe"] });
 	let serverLog = "";
 	server.stderr!.on("data", (data) => { serverLog += data; });
@@ -31,7 +34,10 @@ test("real Herdr launches an idle Pi natively, focuses it, and closes only its p
 			const status = spawnSync("herdr", ["--session", session, "status", "--json"], { env, encoding: "utf8" });
 			if (status.status === 0) {
 				const parsed = JSON.parse(status.stdout);
-				if (parsed.server?.running) { socketPath = parsed.server.socket; break; }
+				if (parsed.server?.running) {
+					const ready = spawnSync("herdr", ["--session", session, "workspace", "list"], { env, encoding: "utf8", timeout: 1000 });
+					if (ready.status === 0) { socketPath = parsed.server.socket; break; }
+				}
 			}
 			if (server.exitCode !== null) throw new Error(`Test server exited: ${serverLog}`);
 			await new Promise((resolve) => setTimeout(resolve, 100));
@@ -92,7 +98,14 @@ test("real Herdr launches an idle Pi natively, focuses it, and closes only its p
 		else process.env[MODEL_SCOPE_ENV] = previousScope;
 		try { if (run) stopTerminal(run); } catch { /* Stop only the isolated server below. */ }
 		spawnSync("herdr", ["--session", session, "server", "stop"], { env, stdio: "ignore", timeout: 5000 });
-		if (server.exitCode === null) server.kill("SIGTERM");
+		if (server.exitCode === null) {
+			server.kill("SIGTERM");
+			await new Promise<void>((resolve) => {
+				server.once("exit", () => resolve());
+				setTimeout(resolve, 2000).unref();
+			});
+		}
+		rmSync(alias, { recursive: true, force: true });
 		writeFileSync(join(dir, "server.log"), serverLog);
 	}
 });
