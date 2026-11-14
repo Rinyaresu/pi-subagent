@@ -2,13 +2,14 @@
 
 Observable, persistent Pi subagents for independent reviews, investigations, and delegated implementation.
 
-Each subagent runs in its own tmux session with a dedicated Pi JSONL session. The parent can inspect status, wait for durable results, steer active work, queue follow-ups, or attach directly to the child TUI.
+Each subagent has a dedicated Pi JSONL session. Inside Herdr (`HERDR_ENV=1`), new children run in native tabs in the parent's workspace, created without changing focus. Outside Herdr they run in tmux sessions. The parent can inspect status, wait for durable results, steer active work, queue follow-ups, or open the child TUI.
 
 ## Requirements
 
 - Pi
 - Node.js 22.19 or newer
-- tmux
+- Herdr 0.9.5+ for native runs, with `HERDR_SOCKET_PATH` and `HERDR_WORKSPACE_ID`
+- tmux for runs outside Herdr and existing tmux children
 
 ## Install
 
@@ -72,7 +73,11 @@ subagent stop a1b2c3
 subagent list
 ```
 
-Use `/subagent` to select and attach to an active child. The status widget shows active names (or handles for unnamed runs) and their current state.
+Use `/subagent` to select an active child. For a Herdr child, it focuses the native pane without stopping the parent TUI or nesting tmux. Return through Herdr's tab navigation. Tmux children keep the existing attach/switch-client behavior. The status widget shows active names (or handles for unnamed runs) and their current state.
+
+Existing metadata without a backend remains tmux-backed. Updating does not migrate live processes; run `/reload` before using the updated command. Native runs retain their original socket/workspace on resume, so keep that server and workspace available. Unreachable servers retain run metadata rather than discarding transcripts. Stopping closes only the child's owned pane, preserving any other panes added to its tab. Terminal identity follows pane moves and protects against reused pane IDs. If tab creation loses its response, a write-ahead recovery record is retained and automatic retries are blocked: inspect the original server and metadata before reconciling it.
+
+The child shell initializes its own environment in the requested cwd. The launcher explicitly forwards the parent's model scope and `PI_CODING_AGENT_DIR`, not arbitrary parent environment variables or credentials.
 
 ## Isolation
 
@@ -85,3 +90,15 @@ Optional spawn flags:
 - `--no-context-files`: ignore repository instruction files
 
 Nested subagents are disabled. Child sessions do not receive the subagent skill. Children survive `/reload`. When their spawning Pi session quits or is replaced, running children are suspended: the process stops, but transcript and metadata are kept. Resuming that parent session relaunches them idle with their full history. `subagent stop` removes a run permanently.
+
+## Tests
+
+`npm test` covers backend selection, model scope, literal launcher arguments, durable messaging/results, cleanup, legacy metadata, `/subagent` focus and parent lifecycle events.
+
+Opt-in runtime smoke test with an isolated named Herdr server and a real idle Pi (no model request):
+
+```sh
+PI_SUBAGENT_HERDR_LIVE=1 node --test herdr-live.test.ts
+```
+
+Test artifacts live under `~/.local/state/pi/work-artifacts/pi-subagent/`. The smoke test stops only its isolated server, never the user's active Herdr session.

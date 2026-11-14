@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,12 +14,12 @@ import {
 	runDisplayName,
 	type InboxMessage,
 	type RunMetadata,
-	tmuxSessionExists,
 	updateMetadata,
 	waitForRunShutdown,
 } from "./shared.ts";
 
 import { MODEL_SCOPE_ENV, modelScopePrompt, type ScopedModel } from "./model-scope.ts";
+import { focusHerdrTerminal, stopTerminal, terminalIsRunning } from "./terminal.ts";
 
 const packageDir = dirname(fileURLToPath(import.meta.url));
 
@@ -54,8 +54,9 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("subagent", {
-		description: "Select and attach to a subagent spawned by this session",
+		description: "Select and open a subagent spawned by this session",
 		handler: async (_args, ctx) => {
+			if (ctx.mode !== "tui") return;
 			const runs = listRuns(ctx.sessionManager.getSessionId()).filter((run) => effectiveRunState(run) !== "exited");
 			if (runs.length === 0) {
 				ctx.ui.notify("No active subagents spawned by this session", "info");
@@ -107,6 +108,15 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			if (!selected || !tui) return;
 			const run = runs.find((candidate) => candidate.handle === selected);
 			if (!run) return;
+
+			if (run.backend === "herdr") {
+				try {
+					focusHerdrTerminal(run);
+				} catch (error) {
+					ctx.ui.notify(`Could not focus ${run.handle}: ${String(error)}`, "error");
+				}
+				return;
+			}
 
 			if (process.env.TMUX) {
 				const exitCode = await new Promise<number | null>((resolveExit) => {
@@ -165,13 +175,14 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		pi.on("session_start", (_event, ctx) => {
 			// Relaunch children that were suspended when this session was last quit or switched away from.
 			for (const run of listRuns(ctx.sessionManager.getSessionId())) {
-				if (!run.suspended || tmuxSessionExists(run.tmuxSession)) continue;
-				if (!existsSync(run.sessionFile)) {
-					removeRunDir(run.runDir);
-					continue;
-				}
-				const starting = updateMetadata(run.runDir, { state: "starting", error: undefined }) ?? run;
+				if (!run.suspended) continue;
 				try {
+					if (terminalIsRunning(run)) continue;
+					if (!existsSync(run.sessionFile)) {
+						removeRunDir(run.runDir);
+						continue;
+					}
+					const starting = updateMetadata(run.runDir, { state: "starting", error: undefined }) ?? run;
 					launchRun(starting);
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
@@ -196,13 +207,19 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			// Suspend running children: stop the process but keep transcript and metadata so resuming this
 			// session relaunches them. Children that already exited on their own are discarded.
 			for (const run of listRuns(ctx.sessionManager.getSessionId())) {
-				if (!tmuxSessionExists(run.tmuxSession)) {
-					if (!run.suspended) removeRunDir(run.runDir);
-					continue;
+				try {
+					if (!terminalIsRunning(run)) {
+						if (!run.suspended) removeRunDir(run.runDir);
+						continue;
+					}
+					updateMetadata(run.runDir, { suspended: true });
+					stopTerminal(run);
+					await waitForRunShutdown(run.runDir);
+				} catch (error) {
+					// Losing the server must never discard a resumable child transcript.
+					updateMetadata(run.runDir, { suspended: true, error: String(error) });
+					if (ctx.hasUI) ctx.ui.notify(`Could not suspend ${runDisplayName(run)}: ${String(error)}`, "error");
 				}
-				updateMetadata(run.runDir, { suspended: true });
-				spawnSync("tmux", ["kill-session", "-t", run.tmuxSession], { stdio: "ignore" });
-				await waitForRunShutdown(run.runDir);
 			}
 		});
 		return;

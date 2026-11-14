@@ -18,7 +18,7 @@ const scope = [
 function spawn(args: string[], env: Record<string, string | undefined>) {
 	return spawnSync(process.execPath, [join(root, "subagent.ts"), "spawn", "--prompt", "test", ...args], {
 		encoding: "utf8",
-		env: { ...process.env, PI_SUBAGENT_RUN_DIR: "", PI_PROVIDER: "provider-a", PI_MODEL: "model-one", ...env },
+		env: { ...process.env, HERDR_ENV: "", PI_SUBAGENT_RUN_DIR: "", PI_PROVIDER: "provider-a", PI_MODEL: "model-one", ...env },
 	});
 }
 
