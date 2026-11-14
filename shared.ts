@@ -14,6 +14,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { readModelScope, requireScopedModel } from "./model-scope.ts";
+import { herdrCall, shellCommand, stopTerminal, terminalIsRunning, type HerdrTerminal } from "./terminal.ts";
 
 export type RunState = "starting" | "busy" | "idle" | "exited" | "error";
 
@@ -24,6 +25,9 @@ export interface RunMetadata {
 	parentSessionId?: string;
 	parentSessionFile?: string;
 	childSessionId?: string;
+	/** Absent in older metadata: those runs keep using tmux. */
+	backend?: "tmux" | "herdr";
+	herdr?: HerdrTerminal;
 	tmuxSession: string;
 	runDir: string;
 	sessionFile: string;
@@ -105,6 +109,13 @@ export function readMetadata(runDir: string): RunMetadata | undefined {
 			metadata.version !== 1 ||
 			typeof metadata.handle !== "string" ||
 			(metadata.name !== undefined && !isValidRunName(metadata.name)) ||
+			(metadata.backend !== undefined && metadata.backend !== "tmux" && metadata.backend !== "herdr") ||
+			(metadata.backend === "herdr" && (!metadata.herdr ||
+				typeof metadata.herdr.socketPath !== "string" || typeof metadata.herdr.workspaceId !== "string" ||
+				(metadata.herdr.tabId !== undefined && typeof metadata.herdr.tabId !== "string") ||
+				(metadata.herdr.paneId !== undefined && typeof metadata.herdr.paneId !== "string") ||
+				(metadata.herdr.terminalId !== undefined && typeof metadata.herdr.terminalId !== "string") ||
+				(metadata.herdr.creationPending !== undefined && typeof metadata.herdr.creationPending !== "boolean"))) ||
 			typeof metadata.tmuxSession !== "string" ||
 			typeof metadata.sessionFile !== "string" ||
 			typeof metadata.runDir !== "string"
@@ -153,11 +164,7 @@ export function removeRunDir(runDir: string): void {
 	rmSync(runDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 }
 
-export function tmuxSessionExists(session: string): boolean {
-	return spawnSync("tmux", ["has-session", "-t", session], { stdio: "ignore" }).status === 0;
-}
-
-/** Start the child pi process for a run in its tmux session. `initialArgs` are only passed on first spawn. */
+/** Start the child Pi in its recorded backend. `initialArgs` are only passed on first spawn. */
 export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): void {
 	requireScopedModel(metadata.provider, metadata.model);
 	const modelPatterns = readModelScope().map((model) =>
@@ -172,47 +179,71 @@ export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): vo
 		// Use the installed pi executable.
 	}
 
-	const result = spawnSync(
-		"tmux",
-		[
-			"new-session",
-			"-d",
-			"-s",
-			metadata.tmuxSession,
-			"-x",
-			"120",
-			"-y",
-			"40",
-			"-c",
-			metadata.cwd,
-			"--",
-			"env",
-			`PI_SUBAGENT_RUN_DIR=${metadata.runDir}`,
-			launcher,
-			"--session",
-			metadata.sessionFile,
-			"--provider",
-			metadata.provider,
-			"--model",
-			metadata.model,
-			"--thinking",
-			metadata.thinking,
-			"--models",
-			modelPatterns,
-			...(metadata.launchArgs ?? []),
-			...initialArgs,
-		],
-		{ encoding: "utf8" },
-	);
+	const argv = [
+		"env",
+		`PI_SUBAGENT_RUN_DIR=${metadata.runDir}`,
+		launcher,
+		"--session", metadata.sessionFile,
+		"--provider", metadata.provider,
+		"--model", metadata.model,
+		"--thinking", metadata.thinking,
+		"--models", modelPatterns,
+		...(metadata.launchArgs ?? []),
+		...initialArgs,
+	];
+	if (metadata.backend === "herdr") {
+		if (!metadata.herdr) throw new Error("Missing Herdr terminal context");
+		// Submit a short launcher path instead of pasting prompts into a shell command line.
+		// Explicit scope propagation avoids the server shell inheriting an unrelated parent's scope.
+		const launcherPath = join(metadata.runDir, "launch.sh");
+		writeFileSync(launcherPath, `#!/bin/sh\nexec ${shellCommand([
+			argv[0], `PI_SUBAGENT_SCOPED_MODELS=${JSON.stringify(readModelScope())}`,
+			`PI_CODING_AGENT_DIR=${getAgentDir()}`, ...argv.slice(1),
+		])}\n`, { mode: 0o700 });
+		metadata.herdr = { ...metadata.herdr, creationPending: true };
+		if (!updateMetadata(metadata.runDir, { herdr: metadata.herdr })) throw new Error("Run metadata disappeared before launch");
+		const created = herdrCall<{
+			tab: { tab_id: string; workspace_id: string };
+			root_pane: { pane_id: string; terminal_id: string };
+		}>(metadata.herdr, [
+			"tab", "create", "--workspace", metadata.herdr.workspaceId,
+			"--cwd", metadata.cwd, "--label", `subagent ${metadata.name ?? metadata.handle}`,
+			"--env", "HERDR_NO_AUTO=1", "--no-focus",
+		]);
+		if (!created.tab?.tab_id || !created.root_pane?.pane_id || !created.root_pane?.terminal_id) throw new Error("Invalid Herdr tab creation response");
+		metadata.herdr = {
+			...metadata.herdr,
+			workspaceId: created.tab.workspace_id,
+			tabId: created.tab.tab_id,
+			paneId: created.root_pane.pane_id,
+			terminalId: created.root_pane.terminal_id,
+			creationPending: false,
+		};
+		try {
+			// Persist identity before Pi starts and updates its own state.
+			if (!updateMetadata(metadata.runDir, { herdr: metadata.herdr })) throw new Error("Run metadata disappeared during launch");
+			herdrCall(metadata.herdr, ["pane", "run", metadata.herdr.paneId!, `exec /bin/sh ${shellCommand([launcherPath])}`]);
+		} catch (error) {
+			stopTerminal(metadata);
+			throw error;
+		}
+		return;
+	}
+	const result = spawnSync("tmux", [
+		"new-session", "-d", "-s", metadata.tmuxSession,
+		"-x", "120", "-y", "40", "-c", metadata.cwd, "--", ...argv,
+	], { encoding: "utf8" });
 	if (result.status !== 0) throw new Error(result.stderr.trim() || "Failed to create tmux session");
 }
 
 export function effectiveRunState(metadata: RunMetadata): RunState {
-	if (
-		(metadata.state === "starting" || metadata.state === "busy" || metadata.state === "idle") &&
-		!tmuxSessionExists(metadata.tmuxSession)
-	) {
-		return "exited";
+	if (metadata.state === "starting" || metadata.state === "busy" || metadata.state === "idle") {
+		try {
+			if (!terminalIsRunning(metadata)) return "exited";
+		} catch {
+			// An unreachable server is not proof the child exited. Keep its transcript/identity.
+			return "error";
+		}
 	}
 	return metadata.state;
 }
