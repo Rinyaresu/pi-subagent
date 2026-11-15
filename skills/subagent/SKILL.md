@@ -9,6 +9,8 @@ Use the `subagent` CLI to delegate work to a separate Pi process with its own co
 
 ## Spawn
 
+Before deciding whether to delegate or choosing a model and effort, read **Subagents** in `~/personal/home/skills/work/SKILL.md`. That section owns decision policy; this skill owns CLI mechanics.
+
 Give each child a short, descriptive name. The name appears in the parent UI, while the generated handle remains its stable identifier:
 
 ```sh
@@ -17,7 +19,7 @@ subagent spawn --name implementation --prompt "Complete task"
 
 Choose a provider/model pair from the parent session's Scoped Models, supplied automatically in the system prompt. The CLI rejects unlisted models and blocks spawning when the scope is empty or unavailable. Existing provider and authorization restrictions still apply; if no listed model is eligible, report the blocker instead of changing the scope or selecting an unlisted fallback.
 
-Without overrides, the child inherits the current provider, model, and reasoning level; a thinking level pinned in Scoped Models takes precedence over inherited reasoning. Use `--provider`, `--model`, or `--thinking` to deliberately choose another eligible configuration. Never pass `$PI_PROVIDER`, `$PI_MODEL`, or `$PI_REASONING_LEVEL` back to the CLI explicitly.
+Provider and model inherit from the current parent environment unless overridden by `--provider` and `--model`. Reasoning precedence is explicit `--thinking`, then the selected Scoped Models entry's pinned thinking level, then the parent's `PI_REASONING_LEVEL`, with `medium` as the CLI fallback when that variable is unset or empty. Changing `--model` alone does not select that model's default effort. Check the selected model's current support; Pi may normalize unsupported levels. Use overrides for a deliberate configuration, and never pass `$PI_PROVIDER`, `$PI_MODEL`, or `$PI_REASONING_LEVEL` back to the CLI explicitly.
 
 `--cwd` defaults to the current directory. Repeat `--prompt` and `--file` as needed; Pi receives all of them in the first user turn. Run `subagent spawn` directly without piping or redirecting its concise output.
 
