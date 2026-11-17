@@ -25,6 +25,7 @@ import {
 
 import { requireScopedModel } from "./model-scope.ts";
 import { attachCommand, currentHerdrTerminal, stopTerminal, terminalIsRunning } from "./terminal.ts";
+import { childMetadata, metadataPublisher } from "./herdr-metadata.ts";
 
 const VALID_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const extensionPath = join(dirname(fileURLToPath(import.meta.url)), "index.ts");
@@ -224,12 +225,25 @@ function statusSubagent(args: string[]): void {
 	);
 }
 
-function renameSubagent(args: string[]): void {
+async function renameSubagent(args: string[]): Promise<void> {
 	if (args.length !== 2) usage();
 	const metadata = getRun(args[0]);
 	const name = normalizeRunName(args[1]);
 	const updated = updateMetadata(metadata.runDir, { name });
 	if (!updated) fail(`Could not rename subagent: ${metadata.handle}`);
+	if (updated.backend === "herdr" && updated.herdr) {
+		try {
+			if (terminalIsRunning(updated)) {
+				updateMetadata(updated.runDir, { herdr: updated.herdr });
+				if (await metadataPublisher.publish(updated.herdr, childMetadata(updated))) {
+					const latest = readMetadata(updated.runDir);
+					if (latest?.herdr?.socketPath === updated.herdr.socketPath && latest.herdr.terminalId === updated.herdr.terminalId) {
+						updateMetadata(updated.runDir, { herdr: updated.herdr });
+					}
+				}
+			}
+		} catch (error) { process.stderr.write(`pi-subagent: Herdr metadata rename unavailable (${String(error)})\n`); }
+	}
 	process.stdout.write(`Renamed ${runDisplayName(updated)}\n`);
 }
 
@@ -331,7 +345,7 @@ async function main(): Promise<void> {
 			statusSubagent(args);
 			break;
 		case "rename":
-			renameSubagent(args);
+			await renameSubagent(args);
 			break;
 		case "send":
 			sendSubagent(args);

@@ -13,14 +13,16 @@ Each subagent has a dedicated Pi JSONL session. Inside Herdr (`HERDR_ENV=1`), ne
 
 ## Install
 
-Clone into Pi's global extension directory and expose the CLI on `PATH`:
+Install this fork at a reviewed commit with Pi's package manager:
 
 ```sh
-git clone git@github.com:earendil-works/pi-subagent.git ~/.pi/agent/extensions/subagent
-ln -s ../extensions/subagent/subagent.ts ~/.pi/agent/bin/subagent
+pi install git:github.com/Rinyaresu/pi-subagent@<reviewed-commit>
 ```
 
-Run `/reload` in an existing Pi session. The extension contributes its bundled skill automatically.
+Replace `<reviewed-commit>` with the full commit from your machine configuration.
+Do not install a second copy in `extensions/`. Preserve dirty package checkouts
+before updating them. Reload existing Pi sessions only when idle. The extension
+contributes its bundled skill automatically.
 
 ## Usage
 
@@ -78,6 +80,27 @@ Use `/subagent` to select an active child. For a Herdr child, it focuses the nat
 Existing metadata without a backend remains tmux-backed. Updating does not migrate live processes; run `/reload` before using the updated command. Native runs retain their original socket/workspace on resume, so keep that server and workspace available. Unreachable servers retain run metadata rather than discarding transcripts. Stopping closes only the child's owned pane, preserving any other panes added to its tab. Terminal identity follows pane moves and protects against reused pane IDs. If tab creation loses its response, a write-ahead recovery record is retained and automatic retries are blocked: inspect the original server and metadata before reconciling it.
 
 The child shell initializes its own environment in the requested cwd. The launcher explicitly forwards the parent's model scope and `PI_CODING_AGENT_DIR`, not arbitrary parent environment variables or credentials.
+
+## Herdr TreeView metadata
+
+On Herdr 0.9.5, the extension publishes display-only `pi_*` metadata after proving
+terminal and native Pi session ownership. It renews metadata every 30 seconds
+with a 120-second TTL. Shutdown stops renewal and awaits in-flight publication;
+it does not synchronously remove the last report.
+
+For subagents with unique, distinct absolute native child and parent paths, the
+same report adds `role=subagent`, `agency_self`, and `agency_parent`. The aliases
+use SHA-256 of compact JSON `["pi","path",path]`, matching
+Algorant/herdr-agent-tree at `c14c3ee4fa9fa709b4e6e984fc53f47cd9bc2a28`.
+The existing `pi_*` hashes keep their independent ID-or-path contract. Missing,
+relative, ID-only, or ambiguous path references clear the aliases without
+inventing an edge. The extension never publishes `agency_lead`.
+
+The extension does not install the plugin, change the Agents view, or configure
+its rows. Those belong to machine configuration. Herdr metadata writes are not
+atomic with identity checks. A replacement Pi using the same path cannot be
+distinguished by the plugin's path-based identity contract. Do not share these
+alias keys with another publisher.
 
 ## Isolation
 

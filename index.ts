@@ -19,9 +19,16 @@ import {
 } from "./shared.ts";
 
 import { MODEL_SCOPE_ENV, modelScopePrompt, type ScopedModel } from "./model-scope.ts";
-import { focusHerdrTerminal, stopTerminal, terminalIsRunning } from "./terminal.ts";
+import { currentHerdrTerminal, focusHerdrTerminal, herdrCall, stopTerminal, terminalIsRunning, type HerdrTerminal } from "./terminal.ts";
+import { childMetadata, metadataPublisher, METADATA_REFRESH_MS as metadataRefreshMs } from "./herdr-metadata.ts";
+import { primaryIdentity } from "./primary-identity.ts";
 
 const packageDir = dirname(fileURLToPath(import.meta.url));
+// This non-inherited process property survives reloads only inside the same live Pi process.
+// It is populated only after process/TTY ownership has been verified.
+const primaryTerminalKey = Symbol.for("pi-subagent.primary-terminal.v1");
+type PrimaryRuntime = typeof process & { [primaryTerminalKey]?: { socketPath: string; terminalId: string } };
+const primaryIdentityWarned = new Set<string>();
 
 function isInboxMessage(value: unknown): value is InboxMessage {
 	if (typeof value !== "object" || value === null) return false;
@@ -37,6 +44,10 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	const runDir = process.env.PI_SUBAGENT_RUN_DIR;
 	if (!runDir) {
 		const syncModelScope = (ctx: ExtensionContext): ScopedModel[] => {
+			const id = ctx.sessionManager.getSessionId();
+			const file = ctx.sessionManager.getSessionFile();
+			if (id) process.env.PI_SESSION_ID = id; else delete process.env.PI_SESSION_ID;
+			if (file) process.env.PI_SESSION_FILE = file; else delete process.env.PI_SESSION_FILE;
 			const models = ctx.scopedModels.map(({ model, thinkingLevel }) => ({
 				provider: model.provider,
 				id: model.id,
@@ -45,7 +56,90 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			process.env[MODEL_SCOPE_ENV] = JSON.stringify(models);
 			return models;
 		};
-		pi.on("session_start", (_event, ctx) => { syncModelScope(ctx); });
+		let lastPublished: string | undefined;
+		let lastPublishedAt = 0;
+		let retryTimer: ReturnType<typeof setTimeout> | undefined;
+		let refreshTimer: ReturnType<typeof setInterval> | undefined;
+		let live = false;
+		let generation = 0;
+		let pending: Promise<void> = Promise.resolve();
+		const publishPrimary = async (ctx: ExtensionContext): Promise<boolean> => {
+			const current = generation;
+			if (process.env.HERDR_ENV !== "1") return true;
+			let socketPath = process.env.HERDR_SOCKET_PATH ?? "(unknown)";
+			try {
+				const terminal = currentHerdrTerminal();
+				if (!terminal) return true;
+				socketPath = terminal.socketPath;
+				const session = { id: ctx.sessionManager.getSessionId(), path: ctx.sessionManager.getSessionFile() ?? null };
+				const name = ctx.sessionManager.getSessionName?.() ?? null;
+				const key = JSON.stringify([socketPath, process.env.HERDR_TERMINAL_ID ?? null, session, name]);
+				if (lastPublished === key && Date.now() - lastPublishedAt < metadataRefreshMs) return true;
+				const { panes } = herdrCall<{ panes: { pane_id: string; terminal_id: string }[] }>(terminal, ["pane", "list"]);
+				if (!Array.isArray(panes)) throw new Error("invalid pane list");
+				const runtime = process as PrimaryRuntime;
+				const saved = runtime[primaryTerminalKey];
+				const inherited = process.env.HERDR_TERMINAL_ID;
+				if (saved?.socketPath === socketPath && inherited && saved.terminalId !== inherited) throw new Error("inherited terminal identity conflicts with runtime identity");
+				let terminalId = saved?.socketPath === socketPath ? saved.terminalId : undefined;
+				if (!terminalId) {
+					terminalId = await primaryIdentity.identify(socketPath, panes);
+					if (inherited && inherited !== terminalId) throw new Error("inherited terminal identity does not belong to this process");
+				}
+				if (!live || current !== generation) return true;
+				const matches = panes.filter((item) => item.terminal_id === terminalId);
+				if (!terminalId || matches.length !== 1) throw new Error("current terminal identity unavailable or ambiguous");
+				const pane = matches[0];
+				runtime[primaryTerminalKey] = { socketPath, terminalId };
+				if (await metadataPublisher.publish({ ...terminal, paneId: pane.pane_id, terminalId }, {
+					agent: "pi", role: "primary", session, task_name: name,
+				})) { lastPublished = key; lastPublishedAt = Date.now(); return true; }
+				return false;
+			} catch (error) {
+				if (!primaryIdentityWarned.has(socketPath)) {
+					primaryIdentityWarned.add(socketPath);
+					const message = `Herdr metadata unavailable (${socketPath}): ${String(error)}`;
+					if (ctx.hasUI) ctx.ui.notify(message, "warning");
+					else process.stderr.write(`pi-subagent: ${message}\n`);
+				}
+				return false;
+			}
+		};
+		// Serialize lifecycle-triggered attempts; timers are bounded and cancelled on teardown.
+		const attempt = (ctx: ExtensionContext): Promise<boolean> => {
+			const current = generation;
+			const result = pending.then(() => live && generation === current ? publishPrimary(ctx) : true);
+			pending = result.then(() => {}, () => {});
+			return result;
+		};
+		pi.on("session_start", async (_event, ctx) => {
+			syncModelScope(ctx);
+			const current = ++generation;
+			live = true;
+			if (retryTimer) clearTimeout(retryTimer);
+			if (refreshTimer) clearInterval(refreshTimer);
+			refreshTimer = setInterval(() => void attempt(ctx), metadataRefreshMs);
+			refreshTimer.unref();
+			const retry = async (remaining: number): Promise<void> => {
+				const success = await attempt(ctx);
+				if (!success && remaining > 0 && generation === current) {
+					retryTimer = setTimeout(() => void retry(remaining - 1), 500);
+					retryTimer.unref();
+				}
+			};
+			await retry(3);
+		});
+		pi.on("agent_start", async (_event, ctx) => { await attempt(ctx); });
+		pi.on("session_info_changed", async (_event, ctx) => { await attempt(ctx); });
+		pi.on("session_shutdown", async () => {
+			live = false;
+			generation++;
+			if (retryTimer) clearTimeout(retryTimer);
+			if (refreshTimer) clearInterval(refreshTimer);
+			retryTimer = undefined;
+			refreshTimer = undefined;
+			await pending;
+		});
 		pi.on("tool_call", (_event, ctx) => { syncModelScope(ctx); });
 		pi.on("before_agent_start", (event, ctx) => ({
 			systemPrompt: `${event.systemPrompt}\n\n${modelScopePrompt(syncModelScope(ctx))}`,
@@ -229,19 +323,63 @@ export default function subagentExtension(pi: ExtensionAPI) {
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let processing = false;
 	let sessionName: string | undefined;
+	let childTerminal: HerdrTerminal | undefined;
+	let metadataGeneration = 0;
+	let metadataRetryTimer: ReturnType<typeof setTimeout> | undefined;
+	let metadataRefreshTimer: ReturnType<typeof setInterval> | undefined;
+	let metadataPending: Promise<void> = Promise.resolve();
+	let lastChildPublished: string | undefined;
+	let lastChildPublishedAt = 0;
 
-	const syncSessionName = (): void => {
+	const publishChild = (): Promise<boolean> => {
+		const current = metadataGeneration;
+		const result = metadataPending.then(async () => {
+			if (!currentContext || current !== metadataGeneration) return true;
+			const metadata = readMetadata(runDir);
+			if (metadata?.backend !== "herdr" || !metadata.herdr || !childTerminal) return true;
+			// A restore/relaunch creates a different terminal. Never adopt it from a live old child.
+			if (metadata.herdr.socketPath !== childTerminal.socketPath || metadata.herdr.terminalId !== childTerminal.terminalId) return false;
+			const context = childMetadata(metadata);
+			const key = JSON.stringify(context);
+			if (lastChildPublished === key && Date.now() - lastChildPublishedAt < metadataRefreshMs) return true;
+			try {
+				metadata.herdr = { ...childTerminal };
+				if (!terminalIsRunning(metadata)) return false;
+				childTerminal = { ...metadata.herdr };
+				updateMetadata(runDir, { herdr: metadata.herdr });
+				const success = await metadataPublisher.publish(metadata.herdr, context);
+				if (current !== metadataGeneration) return true;
+				if (success) {
+					const latest = readMetadata(runDir);
+					if (latest?.herdr?.socketPath !== childTerminal.socketPath || latest.herdr.terminalId !== childTerminal.terminalId) return false;
+					childTerminal = { ...metadata.herdr };
+					updateMetadata(runDir, { herdr: metadata.herdr });
+					lastChildPublished = key;
+					lastChildPublishedAt = Date.now();
+				}
+				return success;
+			} catch (error) {
+				if (currentContext?.hasUI) currentContext.ui.notify(`Herdr metadata unavailable: ${String(error)}`, "warning");
+				return false;
+			}
+		});
+		metadataPending = result.then(() => {}, () => {});
+		return result;
+	};
+
+	const syncSessionName = (): boolean => {
 		const metadata = readMetadata(runDir);
-		if (!metadata) return;
+		if (!metadata) return false;
 		const next = `subagent ${metadata.name ?? metadata.handle}`;
-		if (next === sessionName) return;
+		if (next === sessionName) return false;
 		pi.setSessionName(next);
 		sessionName = next;
+		return true;
 	};
 
 	const processInbox = async (): Promise<void> => {
 		if (processing || !currentContext) return;
-		syncSessionName();
+		if (syncSessionName()) void publishChild();
 		const queueDir = inboxDir(runDir);
 		if (!existsSync(queueDir)) return;
 		processing = true;
@@ -287,11 +425,11 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		}
 	};
 
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", async (_event, ctx) => {
 		currentContext = ctx;
 		const metadata = readMetadata(runDir);
 		if (!metadata) return;
-		updateMetadata(runDir, {
+		const updated = updateMetadata(runDir, {
 			childSessionId: ctx.sessionManager.getSessionId(),
 			sessionFile: ctx.sessionManager.getSessionFile() ?? metadata.sessionFile,
 			state: ctx.isIdle() ? "idle" : "busy",
@@ -299,6 +437,24 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			error: undefined,
 		});
 		syncSessionName();
+		const current = ++metadataGeneration;
+		if (metadataRetryTimer) clearTimeout(metadataRetryTimer);
+		if (metadataRefreshTimer) clearInterval(metadataRefreshTimer);
+		lastChildPublished = undefined;
+		if (updated?.backend === "herdr" && updated.herdr) {
+			childTerminal ??= { ...updated.herdr };
+			metadataRefreshTimer = setInterval(() => void publishChild(), metadataRefreshMs);
+			metadataRefreshTimer.unref();
+			const retry = async (remaining: number): Promise<void> => {
+				const success = await publishChild();
+				if (!success && remaining > 0 && current === metadataGeneration) {
+					metadataRetryTimer = setTimeout(() => void retry(remaining - 1), 500);
+					metadataRetryTimer.unref();
+				}
+			};
+			await retry(3);
+		}
+		if (!currentContext || current !== metadataGeneration) return;
 		if (!timer) {
 			timer = setInterval(() => void processInbox(), 250);
 			timer.unref();
@@ -316,12 +472,18 @@ export default function subagentExtension(pi: ExtensionAPI) {
 		if (ctx.isIdle()) updateMetadata(runDir, { state: "idle" });
 	});
 
-	pi.on("session_shutdown", (event) => {
+	pi.on("session_shutdown", async (event) => {
 		currentContext = undefined;
+		metadataGeneration++;
+		if (metadataRetryTimer) clearTimeout(metadataRetryTimer);
+		if (metadataRefreshTimer) clearInterval(metadataRefreshTimer);
+		metadataRetryTimer = undefined;
+		metadataRefreshTimer = undefined;
 		if (timer) {
 			clearInterval(timer);
 			timer = undefined;
 		}
+		await metadataPending;
 		if (event.reason === "quit") updateMetadata(runDir, { state: "exited" });
 	});
 }
