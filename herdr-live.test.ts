@@ -1,15 +1,17 @@
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { launchRun, readMetadata, writeMetadata, type RunMetadata } from "./shared.ts";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+import { launchRun, listRuns, readMetadata, writeMetadata, type RunMetadata } from "./shared.ts";
 import { focusHerdrTerminal, herdrCall, stopTerminal, terminalIsRunning } from "./terminal.ts";
 import { MODEL_SCOPE_ENV } from "./model-scope.ts";
 
 // Opt-in: a real isolated headless Herdr plus a real idle Pi. No model request is sent.
-test("real Herdr launches an idle Pi natively, focuses it, and closes only its pane", {
+test("real Herdr keeps new Pi children in a separate workspace and preserves their lifecycle", {
 	skip: process.env.PI_SUBAGENT_HERDR_LIVE !== "1", timeout: 60_000,
 }, async () => {
 	const artifacts = join(homedir(), ".local/state/pi/work-artifacts/pi-subagent");
@@ -21,13 +23,19 @@ test("real Herdr launches an idle Pi natively, focuses it, and closes only its p
 	const alias = mkdtempSync(join(tmpdir(), "pi-herdr-"));
 	symlinkSync(dir, join(alias, "xdg"), "dir");
 	const session = "smoke";
-	const env = { ...process.env, XDG_CONFIG_HOME: join(alias, "xdg"), HERDR_CONFIG_PATH: config, HERDR_SOCKET_PATH: "", HERDR_ENV: "", HERDR_SESSION: "" };
+	const agentDir = join(dir, "agent");
+	const env = {
+		...process.env, XDG_CONFIG_HOME: join(alias, "xdg"), XDG_STATE_HOME: join(dir, "state"),
+		HERDR_CONFIG_PATH: config, HERDR_SOCKET_PATH: "", HERDR_ENV: "", HERDR_SESSION: "",
+		PI_CODING_AGENT_DIR: agentDir, PI_SUBAGENT_RUN_DIR: "", OPENAI_API_KEY: "idle-test-only",
+	};
 	const server = spawn("herdr", ["--session", session, "server"], { env, stdio: ["ignore", "pipe", "pipe"] });
 	let serverLog = "";
 	server.stderr!.on("data", (data) => { serverLog += data; });
 	server.stdout!.on("data", (data) => { serverLog += data; });
 	let run: RunMetadata | undefined;
 	const previousScope = process.env[MODEL_SCOPE_ENV];
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 	try {
 		let socketPath: string | undefined;
 		for (let i = 0; i < 100; i++) {
@@ -45,23 +53,38 @@ test("real Herdr launches an idle Pi natively, focuses it, and closes only its p
 		assert.ok(socketPath, `Test server did not start: ${serverLog}`);
 		const context = { socketPath, workspaceId: "" };
 		const created = herdrCall<{ workspace: { workspace_id: string }; root_pane: { pane_id: string } }>(context,
-			["workspace", "create", "--cwd", dir, "--label", "subagent-test", "--no-focus"]);
+			["workspace", "create", "--cwd", dir, "--label", "subagent-test", "--focus"]);
 		context.workspaceId = created.workspace.workspace_id;
 		const parentPane = created.root_pane.pane_id;
-		const scope = [{ provider: "codex-rotator", id: "gpt-6-luna" }];
-		process.env[MODEL_SCOPE_ENV] = JSON.stringify(scope);
-		const runDir = join(dir, "run");
-		mkdirSync(runDir);
-		run = {
-			version: 1, backend: "herdr", herdr: context, handle: "live-test",
-			tmuxSession: "unused-native-test", runDir, sessionFile: join(runDir, "session.jsonl"), cwd: dir,
-			provider: "codex-rotator", model: "gpt-6-luna", thinking: "low",
-			launchArgs: ["--no-skills", "--no-prompt-templates", "--no-context-files"],
-			state: "starting", hasStarted: false, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
-		};
-		writeFileSync(run.sessionFile, "");
-		writeMetadata(run);
-		launchRun(run);
+		const scope = JSON.stringify([{ provider: "openai", id: "gpt-4o" }]);
+		process.env[MODEL_SCOPE_ENV] = scope;
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		writeFileSync(join(dir, "pi-test.sh"),
+			'#!/bin/bash\nargs=("$@")\nif [[ "${!#}" == Task:* ]]; then unset \'args[-1]\'; fi\nexec pi "${args[@]}"\n', { mode: 0o700 });
+		const cli = (...args: string[]) => promisify(execFile)(process.execPath, [
+			fileURLToPath(new URL("./subagent.ts", import.meta.url)), ...args,
+		], {
+			cwd: dir, timeout: 25_000,
+			env: { ...env, [MODEL_SCOPE_ENV]: scope, HERDR_ENV: "1", HERDR_SOCKET_PATH: socketPath,
+				HERDR_WORKSPACE_ID: context.workspaceId, HERDR_PANE_ID: parentPane, PI_SESSION_ID: "smoke-parent",
+				PI_PROVIDER: "openai", PI_MODEL: "gpt-4o", PI_THINKING: "off" },
+		});
+		const workspaces = () => herdrCall<{ workspaces: { workspace_id: string; label: string; focused: boolean; tab_count: number }[] }>(
+			context, ["workspace", "list"]).workspaces;
+		await Promise.all(["first", "second"].map((name) => cli("spawn", "--name", name, "--thinking", "off",
+			"--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--prompt", "Not sent to a model")));
+		const spawned = listRuns("smoke-parent");
+		assert.equal(spawned.length, 2);
+		const layout = workspaces();
+		const parent = layout.find((workspace) => workspace.workspace_id === context.workspaceId);
+		assert.equal(parent?.tab_count, 1, "New children must not add tabs to the parent workspace");
+		assert.equal(parent?.focused, true);
+		const dedicated = layout.filter((workspace) => workspace.label === "Subagents");
+		assert.equal(dedicated.length, 1);
+		assert.equal(dedicated[0].tab_count, 2);
+		assert.ok(spawned.every((child) => child.herdr?.workspaceId === dedicated[0].workspace_id));
+		[run] = spawned;
+		const sibling = spawned[1];
 		for (let i = 0; i < 200; i++) {
 			const current = readMetadata(runDir)!;
 			if (current.childSessionId && current.state === "idle") break;
@@ -94,6 +117,8 @@ test("real Herdr launches an idle Pi natively, focuses it, and closes only its p
 		await new Promise((resolve) => setTimeout(resolve, 300));
 		assert.equal(terminalIsRunning(run), false, "Crashed terminal must not remain running");
 	} finally {
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 		if (previousScope === undefined) delete process.env[MODEL_SCOPE_ENV];
 		else process.env[MODEL_SCOPE_ENV] = previousScope;
 		try { if (run) stopTerminal(run); } catch { /* Stop only the isolated server below. */ }
