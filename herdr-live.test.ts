@@ -2,11 +2,11 @@ import assert from "node:assert/strict";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { launchRun, listRuns, readMetadata, writeMetadata, type RunMetadata } from "./shared.ts";
+import { launchRun, listRuns, readMetadata, updateMetadata, waitForRunShutdown, writeMetadata, type RunMetadata } from "./shared.ts";
 import { focusHerdrTerminal, herdrCall, stopTerminal, terminalIsRunning } from "./terminal.ts";
 import { MODEL_SCOPE_ENV } from "./model-scope.ts";
 
@@ -22,13 +22,19 @@ test("real Herdr keeps new Pi children in a separate workspace and preserves the
 	// State lives under artifacts; a temporary symlink keeps Unix socket names below sun_path limits.
 	const alias = mkdtempSync(join(tmpdir(), "pi-herdr-"));
 	symlinkSync(dir, join(alias, "xdg"), "dir");
-	const session = "smoke";
+	const session = basename(alias);
 	const agentDir = join(dir, "agent");
+	const otherAgentDir = join(dir, "other-agent");
+	mkdirSync(join(agentDir, "extensions"), { recursive: true });
+	mkdirSync(otherAgentDir);
+	symlinkSync(join(agentDir, "extensions"), join(otherAgentDir, "extensions"), "dir");
 	const env = {
 		...process.env, XDG_CONFIG_HOME: join(alias, "xdg"), XDG_STATE_HOME: join(dir, "state"),
 		HERDR_CONFIG_PATH: config, HERDR_SOCKET_PATH: "", HERDR_ENV: "", HERDR_SESSION: "",
 		PI_CODING_AGENT_DIR: agentDir, PI_SUBAGENT_RUN_DIR: "", OPENAI_API_KEY: "idle-test-only",
 	};
+	const integration = spawnSync("herdr", ["integration", "install", "pi"], { env, encoding: "utf8", timeout: 5000 });
+	assert.equal(integration.status, 0, integration.stderr);
 	const server = spawn("herdr", ["--session", session, "server"], { env, stdio: ["ignore", "pipe", "pipe"] });
 	let serverLog = "";
 	server.stderr!.on("data", (data) => { serverLog += data; });
@@ -60,20 +66,23 @@ test("real Herdr keeps new Pi children in a separate workspace and preserves the
 		process.env[MODEL_SCOPE_ENV] = scope;
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		writeFileSync(join(dir, "pi-test.sh"),
-			'#!/bin/bash\nargs=("$@")\nif [[ "${!#}" == Task:* ]]; then unset \'args[-1]\'; fi\nexec pi "${args[@]}"\n', { mode: 0o700 });
-		const cli = (...args: string[]) => promisify(execFile)(process.execPath, [
-			fileURLToPath(new URL("./subagent.ts", import.meta.url)), ...args,
+			'#!/bin/bash\nargs=("$@")\nif [[ "${!#}" == Task:* ]]; then unset \'args[-1]\'; fi\nexec pi --extension "$PI_CODING_AGENT_DIR/extensions/herdr-agent-state.ts" "${args[@]}"\n', { mode: 0o700 });
+		const exec = promisify(execFile);
+		const cli = (piDir: string, name: string) => exec(process.execPath, [
+			fileURLToPath(new URL("./subagent.ts", import.meta.url)), "spawn", "--name", name, "--thinking", "off",
+			"--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--prompt", "Not sent to a model",
 		], {
 			cwd: dir, timeout: 25_000,
-			env: { ...env, [MODEL_SCOPE_ENV]: scope, HERDR_ENV: "1", HERDR_SOCKET_PATH: socketPath,
+			env: { ...env, PI_CODING_AGENT_DIR: piDir, [MODEL_SCOPE_ENV]: scope, HERDR_ENV: "1", HERDR_SOCKET_PATH: socketPath,
 				HERDR_WORKSPACE_ID: context.workspaceId, HERDR_PANE_ID: parentPane, PI_SESSION_ID: "smoke-parent",
-				PI_PROVIDER: "openai", PI_MODEL: "gpt-4o", PI_THINKING: "off" },
+				PI_SESSION_FILE: "", PI_PROVIDER: "openai", PI_MODEL: "gpt-4o", PI_THINKING: "off" },
 		});
 		const workspaces = () => herdrCall<{ workspaces: { workspace_id: string; label: string; focused: boolean; tab_count: number }[] }>(
 			context, ["workspace", "list"]).workspaces;
-		await Promise.all(["first", "second"].map((name) => cli("spawn", "--name", name, "--thinking", "off",
-			"--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--prompt", "Not sent to a model")));
-		const spawned = listRuns("smoke-parent");
+		await Promise.all([cli(agentDir, "first"), cli(otherAgentDir, "second")]);
+		const firstRuns = listRuns("smoke-parent");
+		process.env.PI_CODING_AGENT_DIR = otherAgentDir;
+		const spawned = [...firstRuns, ...listRuns("smoke-parent")];
 		assert.equal(spawned.length, 2);
 		const layout = workspaces();
 		const parent = layout.find((workspace) => workspace.workspace_id === context.workspaceId);
@@ -86,7 +95,7 @@ test("real Herdr keeps new Pi children in a separate workspace and preserves the
 		[run] = spawned;
 		const sibling = spawned[1];
 		for (let i = 0; i < 200; i++) {
-			const current = readMetadata(runDir)!;
+			const current = readMetadata(run!.runDir)!;
 			if (current.childSessionId && current.state === "idle") break;
 			if (i === 199) {
 				const output = herdrCall(run.herdr!, ["pane", "read", run.herdr!.paneId!, "--lines", "40"]);
@@ -95,11 +104,17 @@ test("real Herdr keeps new Pi children in a separate workspace and preserves the
 			await new Promise((resolve) => setTimeout(resolve, 100));
 		}
 		assert.equal(terminalIsRunning(run), true);
+		const getPane = () => herdrCall<{ pane: { focused: boolean; agent: string; tokens?: Record<string, string> } }>(
+			run!.herdr!, ["pane", "get", run!.herdr!.paneId!]).pane;
+		for (let i = 0; i < 50 && getPane().tokens?.pi_role !== "subagent"; i++) {
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+		writeFileSync(join(dir, "pane.json"), JSON.stringify(getPane(), null, 2));
+		assert.equal(getPane().tokens?.pi_role, "subagent");
 		focusHerdrTerminal(run);
-		const pane = herdrCall<{ pane: { focused: boolean; agent: string } }>(run.herdr!, ["pane", "get", run.herdr!.paneId!]).pane;
-		assert.equal(pane.focused, true);
-		assert.equal(pane.agent, "pi");
-		const originalPaneId = run.herdr!.paneId;
+		assert.equal(getPane().focused, true);
+		assert.equal(getPane().agent, "pi");
+		const originalPaneId = run.herdr!.paneId!;
 		herdrCall(run.herdr!, ["pane", "move", originalPaneId!, "--new-workspace", "--no-focus"]);
 		assert.equal(terminalIsRunning(run), true);
 		assert.notEqual(run.herdr!.paneId, originalPaneId);
@@ -108,12 +123,25 @@ test("real Herdr keeps new Pi children in a separate workspace and preserves the
 		assert.equal(terminalIsRunning(run), false);
 		const remaining = herdrCall<{ panes: { pane_id: string }[] }>(context, ["pane", "list"]).panes;
 		assert.ok(remaining.some((pane) => pane.pane_id === parentPane));
-		writeFileSync(join(dir, "result.json"), JSON.stringify({ ok: true, socketPath, child: readMetadata(runDir), parentPane }, null, 2));
+		assert.equal(terminalIsRunning(sibling), true);
+		const previousWorkspace = sibling.herdr!.workspaceId;
+		updateMetadata(sibling.runDir, { suspended: true });
+		stopTerminal(sibling);
+		await waitForRunShutdown(sibling.runDir);
+		assert.ok(!workspaces().some((workspace) => workspace.workspace_id === previousWorkspace));
+		const resume = updateMetadata(sibling.runDir, { state: "starting" })!;
+		await launchRun(resume);
+		assert.notEqual(resume.herdr!.workspaceId, previousWorkspace);
+		assert.equal(workspaces().find((workspace) => workspace.workspace_id === resume.herdr!.workspaceId)?.label, "Subagents");
+		assert.equal(terminalIsRunning(resume), true);
+		stopTerminal(resume);
+		writeFileSync(join(dir, "result.json"), JSON.stringify({ parentTabs: parent?.tab_count, childTabs: dedicated[0].tab_count, resumed: true }, null, 2));
+
 		// A launcher that exits without Pi's shutdown hook must not look alive forever.
 		writeFileSync(join(dir, "pi-test.sh"), "#!/bin/sh\nexit 17\n", { mode: 0o700 });
 		run.herdr = { ...run.herdr!, workspaceId: context.workspaceId };
 		writeMetadata({ ...run, state: "starting" });
-		launchRun(run);
+		await launchRun(run);
 		await new Promise((resolve) => setTimeout(resolve, 300));
 		assert.equal(terminalIsRunning(run), false, "Crashed terminal must not remain running");
 	} finally {

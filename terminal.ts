@@ -8,8 +8,8 @@ export interface HerdrTerminal {
 	paneId?: string;
 	/** Random terminal identity survives pane moves and prevents ID reuse from targeting another terminal. */
 	terminalId?: string;
-	/** Write-ahead marker: a failed create response may still have created a tab. */
 	creationPending?: boolean;
+	subagentsWorkspaceId?: string;
 }
 
 /** Pin every operation to the server that owns the run, not the currently focused session. */
@@ -45,7 +45,7 @@ export function currentHerdrTerminal(): HerdrTerminal | undefined {
 
 export function terminalIsRunning(metadata: RunMetadata): boolean {
 	if (metadata.backend === "herdr") {
-		if (metadata.herdr?.creationPending) throw new Error(`Herdr tab creation uncertain for ${metadata.handle}; inspect the owning server before retrying`);
+		if (metadata.herdr?.creationPending) throw new Error(`Herdr terminal creation uncertain for ${metadata.handle}; inspect the owning server before retrying`);
 		if (!metadata.herdr?.paneId) return false;
 		if (!metadata.herdr.terminalId) throw new Error(`Missing Herdr terminal identity for ${metadata.handle}`);
 		const { panes } = herdrCall<{
