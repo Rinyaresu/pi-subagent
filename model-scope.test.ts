@@ -22,7 +22,7 @@ function spawn(args: string[], env: Record<string, string | undefined>) {
 	});
 }
 
-test("scope validation and model guidance", () => {
+test("scope validation and model guidance", async () => {
 	const previous = process.env[MODEL_SCOPE_ENV];
 	try {
 		delete process.env[MODEL_SCOPE_ENV];
@@ -34,7 +34,7 @@ test("scope validation and model guidance", () => {
 		process.env[MODEL_SCOPE_ENV] = JSON.stringify(scope);
 		assert.equal(requireScopedModel("provider-a", "model-one").thinkingLevel, "high");
 		assert.throws(() => requireScopedModel("provider-b", "model-one"), /outside/);
-		assert.throws(() => launchRun({ provider: "provider-a", model: "removed-model" } as RunMetadata), /outside/);
+		await assert.rejects(launchRun({ provider: "provider-a", model: "removed-model" } as RunMetadata), /outside/);
 		assert.match(modelScopePrompt(scope), /provider-b\/model-two/);
 		assert.match(modelScopePrompt([]), /blocked/);
 	} finally {

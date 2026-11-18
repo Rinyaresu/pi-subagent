@@ -79,7 +79,7 @@ function generateHandle(): string {
 	fail("Could not allocate a unique subagent handle");
 }
 
-function spawnSubagent(args: string[]): void {
+async function spawnSubagent(args: string[]): Promise<void> {
 	if (process.env.PI_SUBAGENT_RUN_DIR) fail("Nested subagents are disabled");
 	let name: string | undefined;
 	let provider = process.env.PI_PROVIDER;
@@ -201,7 +201,7 @@ function spawnSubagent(args: string[]): void {
 	const initialArgs = files.map((file) => `@${file}`);
 	if (prompts.length > 0) initialArgs.push(`Task:\n${prompts.join("\n\n")}`);
 	try {
-		launchRun(metadata, initialArgs);
+		await launchRun(metadata, initialArgs, "new");
 	} catch (error) {
 		// Preserve identity and transcript if cleanup cannot reach the owning server.
 		try {
@@ -339,7 +339,7 @@ async function main(): Promise<void> {
 	const command = args.shift();
 	switch (command) {
 		case "spawn":
-			spawnSubagent(args);
+			await spawnSubagent(args);
 			break;
 		case "status":
 			statusSubagent(args);

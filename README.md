@@ -2,7 +2,7 @@
 
 Observable, persistent Pi subagents for independent reviews, investigations, and delegated implementation.
 
-Each subagent has a dedicated Pi JSONL session. Inside Herdr (`HERDR_ENV=1`), new children run in native tabs in the parent's workspace, created without changing focus. Outside Herdr they run in tmux sessions. The parent can inspect status, wait for durable results, steer active work, queue follow-ups, or open the child TUI.
+Each subagent has a dedicated Pi JSONL session. Inside Herdr (`HERDR_ENV=1`), new children open in native tabs in a shared `Subagents` workspace, without changing focus or adding tabs to the parent's workspace. Outside Herdr they run in tmux sessions. The parent can inspect status, wait for durable results, steer active work, queue follow-ups, or open the child TUI.
 
 ## Requirements
 
@@ -75,9 +75,11 @@ subagent stop a1b2c3
 subagent list
 ```
 
-Use `/subagent` to select an active child. For a Herdr child, it focuses the native pane without stopping the parent TUI or nesting tmux. Return through Herdr's tab navigation. Tmux children keep the existing attach/switch-client behavior. The status widget shows active names (or handles for unnamed runs) and their current state.
+Use `/subagent` to select an active child. For a Herdr child, it focuses the native pane without stopping the parent TUI or nesting tmux. Return through Herdr's workspace navigation. Tmux children keep the existing attach/switch-client behavior. The status widget shows active names (or handles for unnamed runs) and their current state.
 
-Existing metadata without a backend remains tmux-backed. Updating does not migrate live processes; run `/reload` before using the updated command. Native runs retain their original socket/workspace on resume, so keep that server and workspace available. Unreachable servers retain run metadata rather than discarding transcripts. Stopping closes only the child's owned pane, preserving any other panes added to its tab. Terminal identity follows pane moves and protects against reused pane IDs. If tab creation loses its response, a write-ahead recovery record is retained and automatic retries are blocked: inspect the original server and metadata before reconciling it.
+Existing metadata without a backend remains tmux-backed. Updating does not migrate live processes; run `/reload` before using the updated command. Native runs keep their original server and resume in their recorded workspace if it still exists. If Herdr removes that workspace after the last pane closes, children originally launched in `Subagents` can resume in a replacement workspace on the same server. Older runs still require their recorded workspace. Stopping closes only the child's owned pane and preserves any other panes in its tab. Terminal identity follows pane moves and protects against reused pane IDs.
+
+The first child uses the new workspace's initial pane. Later children reuse the workspace even if renamed. A workspace named `Subagents` without the extension's marker is left alone. Concurrent launches on the same Herdr server wait for workspace allocation. If creation is uncertain, the extension keeps recovery metadata and does not retry blindly. If a workspace allocation remains locked, inspect the original server and the lock path in the error before clearing it.
 
 The child shell initializes its own environment in the requested cwd. The launcher explicitly forwards the parent's model scope and `PI_CODING_AGENT_DIR`, not arbitrary parent environment variables or credentials.
 

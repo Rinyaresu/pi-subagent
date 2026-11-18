@@ -13,6 +13,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
+import { createHerdrTerminal } from "./herdr-workspace.ts";
 import { readModelScope, requireScopedModel } from "./model-scope.ts";
 import { herdrCall, shellCommand, stopTerminal, terminalIsRunning, type HerdrTerminal } from "./terminal.ts";
 
@@ -115,7 +116,8 @@ export function readMetadata(runDir: string): RunMetadata | undefined {
 				(metadata.herdr.tabId !== undefined && typeof metadata.herdr.tabId !== "string") ||
 				(metadata.herdr.paneId !== undefined && typeof metadata.herdr.paneId !== "string") ||
 				(metadata.herdr.terminalId !== undefined && typeof metadata.herdr.terminalId !== "string") ||
-				(metadata.herdr.creationPending !== undefined && typeof metadata.herdr.creationPending !== "boolean"))) ||
+				(metadata.herdr.creationPending !== undefined && typeof metadata.herdr.creationPending !== "boolean") ||
+				(metadata.herdr.subagentsWorkspaceId !== undefined && typeof metadata.herdr.subagentsWorkspaceId !== "string"))) ||
 			typeof metadata.tmuxSession !== "string" ||
 			typeof metadata.sessionFile !== "string" ||
 			typeof metadata.runDir !== "string"
@@ -165,7 +167,7 @@ export function removeRunDir(runDir: string): void {
 }
 
 /** Start the child Pi in its recorded backend. `initialArgs` are only passed on first spawn. */
-export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): void {
+export async function launchRun(metadata: RunMetadata, initialArgs: string[] = [], placement: "new" | "recorded" = "recorded"): Promise<void> {
 	requireScopedModel(metadata.provider, metadata.model);
 	const modelPatterns = readModelScope().map((model) =>
 		`${model.provider}/${model.id}${model.thinkingLevel ? `:${model.thinkingLevel}` : ""}`,
@@ -200,28 +202,11 @@ export function launchRun(metadata: RunMetadata, initialArgs: string[] = []): vo
 			argv[0], `PI_SUBAGENT_SCOPED_MODELS=${JSON.stringify(readModelScope())}`,
 			`PI_CODING_AGENT_DIR=${getAgentDir()}`, ...argv.slice(1),
 		])}\n`, { mode: 0o700 });
-		metadata.herdr = { ...metadata.herdr, creationPending: true };
-		if (!updateMetadata(metadata.runDir, { herdr: metadata.herdr })) throw new Error("Run metadata disappeared before launch");
-		const created = herdrCall<{
-			tab: { tab_id: string; workspace_id: string };
-			root_pane: { pane_id: string; terminal_id: string };
-		}>(metadata.herdr, [
-			"tab", "create", "--workspace", metadata.herdr.workspaceId,
-			"--cwd", metadata.cwd, "--label", `subagent ${metadata.name ?? metadata.handle}`,
-			"--env", "HERDR_NO_AUTO=1", "--no-focus",
-		]);
-		if (!created.tab?.tab_id || !created.root_pane?.pane_id || !created.root_pane?.terminal_id) throw new Error("Invalid Herdr tab creation response");
-		metadata.herdr = {
-			...metadata.herdr,
-			workspaceId: created.tab.workspace_id,
-			tabId: created.tab.tab_id,
-			paneId: created.root_pane.pane_id,
-			terminalId: created.root_pane.terminal_id,
-			creationPending: false,
-		};
+		await createHerdrTerminal(metadata.herdr, metadata.cwd, `subagent ${metadata.name ?? metadata.handle}`, placement, (terminal) => {
+			metadata.herdr = terminal;
+			if (!updateMetadata(metadata.runDir, { herdr: terminal })) throw new Error("Run metadata disappeared during launch");
+		});
 		try {
-			// Persist identity before Pi starts and updates its own state.
-			if (!updateMetadata(metadata.runDir, { herdr: metadata.herdr })) throw new Error("Run metadata disappeared during launch");
 			herdrCall(metadata.herdr, ["pane", "run", metadata.herdr.paneId!, `exec /bin/sh ${shellCommand([launcherPath])}`]);
 		} catch (error) {
 			stopTerminal(metadata);

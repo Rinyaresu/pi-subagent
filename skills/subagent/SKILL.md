@@ -5,7 +5,7 @@ description: Spawn and communicate with observable Pi subagents for second opini
 
 # Subagent
 
-Use the `subagent` CLI to delegate work to a separate Pi process with its own context. Inside Herdr (`HERDR_ENV=1`), each new child gets an unfocused native tab in the parent's workspace. Outside Herdr, children use tmux sessions. Existing runs retain their recorded backend. Managed subagents cannot spawn nested subagents, and this skill is not loaded into their sessions.
+Use the `subagent` CLI to delegate work to a separate Pi process with its own context. Inside Herdr (`HERDR_ENV=1`), each new child gets an unfocused native tab in the shared `Subagents` workspace. Outside Herdr, children use tmux sessions. Existing runs retain their recorded backend. Managed subagents cannot spawn nested subagents, and this skill is not loaded into their sessions.
 
 ## Spawn
 
@@ -94,6 +94,6 @@ subagent stop <handle>
 
 Explicitly stop every subagent when it is no longer needed; do not leave completed subagents running idle. This closes the child's owned Herdr pane or tmux session and removes the run transcript and metadata. Other panes added to the Herdr tab are preserved. If the owning Herdr server is unavailable, stopping fails and retains the run for recovery. Keep an idle subagent alive only when concrete follow-up work is expected, then stop it afterward.
 
-The interactive `/subagent` command lists active subagents spawned by the current Pi session. Selecting a native Herdr child focuses its pane without suspending the parent TUI or attaching tmux. Return to the parent using Herdr's tab navigation. For tmux children, selection suspends the parent TUI and attaches to the child's session; detaching returns to the parent. When the parent already runs inside tmux, selection switches the current tmux client instead.
+The interactive `/subagent` command lists active subagents spawned by the current Pi session. Selecting a native Herdr child focuses its pane without suspending the parent TUI or attaching tmux. Return to the parent using Herdr's workspace navigation. For tmux children, selection suspends the parent TUI and attaches to the child's session; detaching returns to the parent. When the parent already runs inside tmux, selection switches the current tmux client instead.
 
-Herdr runs are pinned to their original socket and workspace, including when resuming a suspended parent. Keep that server/workspace available. A connection failure is not treated as proof that the child exited, and does not discard its transcript. An uncertain tab creation retains a recovery record and blocks automatic relaunch; inspect the original server and run metadata before reconciling it. The child shell initializes its own environment; only model scope and `PI_CODING_AGENT_DIR` are explicitly forwarded from the parent. Run `/reload` after updating this extension; already-running tmux children are not migrated.
+Herdr runs stay on their original server. On resume, children keep their recorded workspace if it exists. Children originally launched in `Subagents` can resume there even when Herdr removed the old workspace. Older runs still require their recorded workspace. If creation is uncertain, inspect the original server and recovery metadata before retrying. The child shell initializes its own environment; only model scope and `PI_CODING_AGENT_DIR` are explicitly forwarded from the parent. Run `/reload` after updating this extension; already-running tmux children are not migrated.

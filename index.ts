@@ -266,7 +266,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 			);
 		};
 
-		pi.on("session_start", (_event, ctx) => {
+		pi.on("session_start", async (_event, ctx) => {
 			// Relaunch children that were suspended when this session was last quit or switched away from.
 			for (const run of listRuns(ctx.sessionManager.getSessionId())) {
 				if (!run.suspended) continue;
@@ -277,7 +277,7 @@ export default function subagentExtension(pi: ExtensionAPI) {
 						continue;
 					}
 					const starting = updateMetadata(run.runDir, { state: "starting", error: undefined }) ?? run;
-					launchRun(starting);
+					await launchRun(starting);
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
 					updateMetadata(run.runDir, { state: "error", error: message });
